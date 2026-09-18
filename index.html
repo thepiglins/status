@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Piglins Status</title>
+<style>
+  :root {
+    --bg: #0d1017; --card: #161b26; --line: #262d3d;
+    --text: #e8ebf2; --dim: #8b93a7;
+    --ok: #4ade80; --down: #f87171; --warn: #fbbf24;
+    --accent: #f2a65a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, sans-serif;
+    display: flex; justify-content: center; padding: 40px 16px;
+  }
+  main { width: 100%; max-width: 640px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--dim); margin: 0 0 28px; font-size: 13px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; margin-bottom: 12px;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--warn); flex: none; }
+  .card.ok .dot { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+  .card.down .dot { background: var(--down); box-shadow: 0 0 10px var(--down); }
+  .name { font-weight: 700; margin-right: auto; }
+  .meta { color: var(--dim); font-size: 13px; }
+  .card.down .meta { color: var(--down); }
+  .strip { display: flex; gap: 2px; width: 100%; margin-top: 4px; }
+  .tick { flex: 1; height: 8px; border-radius: 2px; background: var(--line); }
+  .tick.ok { background: var(--ok); opacity: .75; }
+  .tick.down { background: var(--down); }
+  .incident {
+    border-left: 3px solid var(--warn); background: var(--card);
+    border-radius: 0 10px 10px 0; padding: 12px 16px; margin-bottom: 10px;
+  }
+  .incident h3 { margin: 0 0 2px; font-size: 14px; }
+  .incident.resolved { border-left-color: var(--ok); opacity: .8; }
+  .incident p { margin: 0; color: var(--dim); font-size: 13px; }
+  footer { color: var(--dim); font-size: 12px; margin-top: 28px; }
+  h2 { font-size: 15px; color: var(--dim); margin: 28px 0 10px; text-transform: uppercase; letter-spacing: .06em; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span>Piglins</span> Status</h1>
+  <p class="sub">Live checks run from your browser every 30 seconds. The
+    history strip is what <em>your</em> browser has seen this visit and
+    across visits on this device (last 24h).</p>
+
+  <div id="targets"></div>
+
+  <h2 id="incidents-title" hidden>Incidents</h2>
+  <div id="incidents"></div>
+
+  <footer>Voice sessions are peer-to-peer; an edge blip affects logins
+    and relays, not calls already running. — piglins.com</footer>
+</main>
+<script>
+  // One card per edge.
+  const TARGETS = [
+    { name: 'Voice Edge', url: 'https://edge.piglins.com/status' },
+  ];
+
+  const POLL_SECONDS = 30;
+  const HISTORY_TICKS = 48; // 24h at one tick per 30 min
+  const targetsBox = document.getElementById('targets');
+
+  const history = JSON.parse(localStorage.getItem('piglin-status-history') || '{}');
+  const bucket = () => Math.floor(Date.now() / 1_800_000); // 30-min buckets
+
+  function remember(name, ok) {
+    const slots = history[name] || {};
+    const now = bucket();
+    // a bucket with any failure stays red: outages must not be averaged away
+    slots[now] = slots[now] === false ? false : ok;
+    for (const key of Object.keys(slots)) if (now - key >= HISTORY_TICKS) delete slots[key];
+    history[name] = slots;
+    localStorage.setItem('piglin-status-history', JSON.stringify(history));
+  }
+
+  function strip(name) {
+    const slots = history[name] || {};
+    const now = bucket();
+    let out = '';
+    for (let i = HISTORY_TICKS - 1; i >= 0; i--) {
+      const state = slots[now - i];
+      out += `<span class="tick${state === true ? ' ok' : state === false ? ' down' : ''}"></span>`;
+    }
+    return `<div class="strip">${out}</div>`;
+  }
+
+  async function check(target) {
+    const started = performance.now();
+    try {
+      const response = await fetch(target.url, { cache: 'no-store', signal: AbortSignal.timeout(8000) });
+      const body = await response.json();
+      if (!response.ok || !body.ok) throw new Error('unhealthy');
+      const ms = Math.round(performance.now() - started);
+      const days = Math.floor((body.uptimeSeconds || 0) / 86400);
+      remember(target.name, true);
+      return { ok: true, meta: `${ms} ms · ${body.sessions} session(s) · ${body.tunnels} server(s) · up ${days}d` };
+    } catch {
+      remember(target.name, false);
+      return { ok: false, meta: 'unreachable' };
+    }
+  }
+
+  async function render() {
+    const results = await Promise.all(TARGETS.map(check));
+    targetsBox.innerHTML = TARGETS.map((target, index) => `
+      <div class="card ${results[index].ok ? 'ok' : 'down'}">
+        <span class="dot"></span>
+        <span class="name">${target.name}</span>
+        <span class="meta">${results[index].ok ? 'Operational' : 'DOWN'} · ${results[index].meta}</span>
+        ${strip(target.name)}
+      </div>`).join('');
+  }
+
+  async function incidents() {
+    try {
+      const response = await fetch('incidents.json', { cache: 'no-store' });
+      if (!response.ok) return;
+      const list = await response.json();
+      if (!Array.isArray(list) || list.length === 0) return;
+      document.getElementById('incidents-title').hidden = false;
+      document.getElementById('incidents').innerHTML = list.map((item) => `
+        <div class="incident${item.resolved ? ' resolved' : ''}">
+          <h3>${item.title} <span class="meta">· ${item.when}${item.resolved ? ' · resolved' : ''}</span></h3>
+          <p>${item.body}</p>
+        </div>`).join('');
+    } catch { /* no incidents file is the good outcome */ }
+  }
+
+  render();
+  incidents();
+  setInterval(render, POLL_SECONDS * 1000);
+</script>
+</body>
+</html>
